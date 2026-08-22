@@ -9,6 +9,7 @@
 #   ./bippass.sh deploy     rebuild locally, ship the images, restart
 #   ./bippass.sh build      build the images without shipping them
 #   ./bippass.sh mail-key   prompt for the Resend API key and store it on the server
+#   ./bippass.sh prices     show / sync the Stripe prices for the plans table
 #
 # A dedicated droplet, unlike EVO-Connect's — nothing else runs here. It is still 1 vCPU
 # / 957 MB and cannot build any of this: a Go workspace spread over 25 modules, and a
@@ -35,7 +36,7 @@ REPO=${BIPPASS_REPO:-$HOME/work/personal/bippass}
 PUBLIC_ORIGIN=${PUBLIC_ORIGIN:-https://bippass.com}
 API_ORIGIN=${API_ORIGIN:-https://api.bippass.com}
 
-IMAGES=(bippass-api bippass-worker bippass-migrate bippass-web)
+IMAGES=(bippass-api bippass-worker bippass-migrate bippass-stripe-prices bippass-web)
 
 build() {
   local version be_rev fe_rev
@@ -54,7 +55,7 @@ build() {
   # bippass-backend, whose go.work + local replaces are what make the modules resolve —
   # none of them builds alone.
   cd "$REPO/bippass-backend"
-  for b in api worker migrate; do
+  for b in api worker migrate stripe-prices; do
     echo "==> bippass-$b"
     docker build --build-arg "BINARY=$b" --build-arg "VERSION=$version" \
       --label "org.opencontainers.image.revision=$be_rev" -t "bippass-$b:latest" .
@@ -230,6 +231,23 @@ PROVISION
     "$SELF" status
     ;;
 
+  prices)
+    # One-shot, not a service: creates the Stripe Price objects the plans table
+    # describes and records their ids back on the rows. Runs on the droplet because
+    # postgres publishes no host port — there is no route to the database from here.
+    #
+    # Reads the same .env as the API, so it uses the same STRIPE_SECRET and the same
+    # database. Nothing is printed that is not already public (plan names and prices)
+    # or a Stripe price id, which is not a secret.
+    action=${2:-show}
+    shift 2 2>/dev/null || true
+    # `compose run` rather than `docker run`: it applies the same .env, the same
+    # DB_HOST override and the same network the API uses. A hand-written docker run
+    # got all three wrong — starting with the network, which compose names `bippass`,
+    # not the `<project>_default` the convention would suggest.
+    ssh "$HOST" "cd $REMOTE && docker compose --profile tools run --rm stripe-prices $action $*"
+    ;;
+
   logs)
     ssh "$HOST" "cd $REMOTE && docker compose logs -f --tail=200 ${2:-}"
     ;;
@@ -283,7 +301,7 @@ PROVISION
     ;;
 
   *)
-    echo "usage: $SELF [shell|provision|build|deploy|logs [service]|status]" >&2
+    echo "usage: $SELF [shell|provision|build|deploy|logs [service]|status|prices [show|sync] [-n]]" >&2
     exit 2
     ;;
 esac
