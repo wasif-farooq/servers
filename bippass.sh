@@ -9,6 +9,7 @@
 #   ./bippass.sh deploy     rebuild locally, ship the images, restart
 #   ./bippass.sh build      build the images without shipping them
 #   ./bippass.sh mail-key   prompt for the Resend API key and store it on the server
+#   ./bippass.sh stripe-key prompt for the Stripe keys and store them on the server
 #   ./bippass.sh prices     show / sync the Stripe prices for the plans table
 #
 # A dedicated droplet, unlike EVO-Connect's — nothing else runs here. It is still 1 vCPU
@@ -196,6 +197,94 @@ PROVISION
       && docker compose up -d api worker'
     ;;
 
+  stripe-key)
+    # Prompts on the SERVER and writes straight to .env, like mail-key: each value goes
+    # from your keyboard into the file, never through an argument (visible in ps), never
+    # through the local shell's history, never through a chat window.
+    #
+    # All three keys live here because all three are read server-side at runtime — the
+    # publishable key too, which the API hands to the browser in the SetupIntent response
+    # rather than the frontend baking it in. So none of this needs a rebuild, only a
+    # restart of the two services that read config.
+    #
+    # Blank input leaves a value untouched, so one key can be rotated without retyping
+    # the others.
+    ssh -t "$HOST" 'cd /srv/bippass || exit 1
+      # Rewrite rather than sed-substitute: a sed replacement breaks on any delimiter
+      # that appears in the value, and a webhook secret is base64. Writing through cat
+      # keeps the original inode and its 600 permissions.
+      upsert() {
+        tmp=$(mktemp) || return 1
+        grep -v "^$1=" .env > "$tmp"
+        printf "%s=%s\n" "$1" "$2" >> "$tmp"
+        cat "$tmp" > .env
+        rc=$?; rm -f "$tmp"; return $rc
+      }
+      changed=0
+
+      read -rsp "Stripe secret key  sk_… (blank = leave unchanged): " SK && echo
+      if [ -n "$SK" ]; then
+        case "$SK" in
+          sk_live_*) echo "  → LIVE mode. Real cards will be charged." ;;
+          sk_test_*) echo "  → test mode." ;;
+          rk_*)      echo "  → restricted key. It must allow writing products, prices, customers and subscriptions." ;;
+          *)         echo "  ! does not look like a Stripe secret key (expected sk_ or rk_). Storing anyway." ;;
+        esac
+        upsert STRIPE_SECRET "$SK" && changed=1
+      fi
+      unset SK
+
+      read -rsp "Webhook signing secret  whsec_… (blank = leave unchanged): " WH && echo
+      if [ -n "$WH" ]; then
+        case "$WH" in
+          whsec_*) : ;;
+          *) echo "  ! does not look like a signing secret (expected whsec_). Storing anyway." ;;
+        esac
+        upsert STRIPE_WEBHOOK_SECRET "$WH" && changed=1
+      fi
+      unset WH
+
+      # Not secret — it ships to every browser that opens the card form — so it is not
+      # hidden while typing, and it is echoed back in full for checking.
+      read -rp  "Publishable key  pk_… (blank = leave unchanged): " PK
+      if [ -n "$PK" ]; then
+        upsert STRIPE_PUBLISHABLE_KEY "$PK" && changed=1
+      fi
+
+      echo
+      # Report what is stored without printing the secrets: length and prefix are enough
+      # to catch the two real mistakes — an empty value, and live-vs-test confusion.
+      # Reports all three by name, including the ones absent from the file. An awk pass
+      # over existing lines prints nothing for a missing key, which reads identically to
+      # everything being fine.
+      report() {
+        line=$(grep "^$1=" .env | head -1)
+        if [ -z "$line" ]; then printf "  %-24s not set\n" "$1"; return; fi
+        val=${line#*=}
+        if [ -z "$val" ]; then printf "  %-24s EMPTY\n" "$1"; return; fi
+        if [ "$2" = "public" ]; then
+          printf "  %-24s %s\n" "$1" "$val"
+        else
+          printf "  %-24s %s… (%d chars)\n" "$1" "$(printf %s "$val" | cut -c1-9)" "${#val}"
+        fi
+      }
+      report STRIPE_SECRET
+      report STRIPE_WEBHOOK_SECRET
+      report STRIPE_PUBLISHABLE_KEY public
+
+      if [ "$changed" = "1" ]; then
+        echo
+        echo "restarting api + worker…"
+        docker compose up -d api worker >/dev/null 2>&1 && echo "  done"
+        echo
+        echo "next: verify the key and create the prices —"
+        echo "    bippass.sh prices sync -n     # dry run, proves Stripe accepts the key"
+        echo "    bippass.sh prices sync"
+      else
+        echo "nothing changed"
+      fi'
+    ;;
+
   build)
     build
     docker images --filter=reference='bippass-*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
@@ -301,7 +390,7 @@ PROVISION
     ;;
 
   *)
-    echo "usage: $SELF [shell|provision|build|deploy|logs [service]|status|prices [show|sync] [-n]]" >&2
+    echo "usage: $SELF [shell|provision|build|deploy|logs [service]|status|mail-key|stripe-key|prices [show|sync] [-n]]" >&2
     exit 2
     ;;
 esac
