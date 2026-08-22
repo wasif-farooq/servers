@@ -216,6 +216,16 @@ PROVISION
     echo "restarting…"
     ssh "$HOST" "cd $REMOTE && docker compose up -d"
 
+    # The Caddyfile is a bind mount, and `up -d` only recreates a container when its image
+    # or its compose definition changed — editing a mounted file changes neither. So a
+    # Caddyfile-only change ships to the server and then sits there, inert, while the
+    # running Caddy serves the old config and the deploy reports success. Reload explicitly.
+    # `caddy reload` is graceful: it validates the new config first and keeps serving the
+    # old one if it does not parse, so a bad Caddyfile cannot take the edge down here.
+    echo "reloading caddy…"
+    ssh "$HOST" "cd $REMOTE && docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile" \
+      2>&1 | grep -viE '"level":"(info|warn)"' || true
+
     sleep 8
     "$SELF" status
     ;;
