@@ -21,6 +21,11 @@
 # ports at all.
 set -euo pipefail
 
+# Absolute, because `build` cd's into the repo trees to run docker build. A relative $0
+# stops resolving the moment the working directory changes — which is how `deploy` used to
+# die on its very last line, reporting a failure after having already deployed successfully.
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
 HOST=root@165.22.176.141
 REMOTE=/srv/bippass
 REPO=${BIPPASS_REPO:-$HOME/work/personal/bippass}
@@ -171,7 +176,7 @@ EOF
 chmod 600 "$REMOTE/.env"
 echo "wrote $REMOTE/.env (0600)"
 PROVISION
-    echo "provisioned. now: $0 deploy"
+    echo "provisioned. now: $SELF deploy"
     ;;
 
   mail-key)
@@ -212,7 +217,7 @@ PROVISION
     ssh "$HOST" "cd $REMOTE && docker compose up -d"
 
     sleep 8
-    "$0" status
+    "$SELF" status
     ;;
 
   logs)
@@ -259,7 +264,7 @@ PROVISION
         # How far behind, when the deployed commit is still known locally.
         behind=$(git -C "$REPO/$repo" rev-list --count "$deployed..HEAD" 2>/dev/null || echo "?")
         printf '  %-9s %s — STALE, %s commit(s) behind %s · run: %s deploy\n' \
-          "$label" "$deployed" "$behind" "$local_head" "$0"
+          "$label" "$deployed" "$behind" "$local_head" "$SELF"
       fi
     }
 
@@ -268,7 +273,7 @@ PROVISION
     ;;
 
   *)
-    echo "usage: $0 [shell|provision|build|deploy|logs [service]|status]" >&2
+    echo "usage: $SELF [shell|provision|build|deploy|logs [service]|status]" >&2
     exit 2
     ;;
 esac
