@@ -37,7 +37,7 @@ REPO=${BIPPASS_REPO:-$HOME/work/personal/bippass}
 PUBLIC_ORIGIN=${PUBLIC_ORIGIN:-https://bippass.com}
 API_ORIGIN=${API_ORIGIN:-https://api.bippass.com}
 
-IMAGES=(bippass-api bippass-worker bippass-migrate bippass-stripe-prices bippass-web)
+IMAGES=(bippass-api bippass-worker bippass-migrate bippass-stripe-prices bippass-paddle-prices bippass-web)
 
 build() {
   local version be_rev fe_rev
@@ -56,7 +56,7 @@ build() {
   # bippass-backend, whose go.work + local replaces are what make the modules resolve —
   # none of them builds alone.
   cd "$REPO/bippass-backend"
-  for b in api worker migrate stripe-prices; do
+  for b in api worker migrate stripe-prices paddle-prices; do
     echo "==> bippass-$b"
     docker build --build-arg "BINARY=$b" --build-arg "VERSION=$version" \
       --label "org.opencontainers.image.revision=$be_rev" -t "bippass-$b:latest" .
@@ -67,9 +67,17 @@ build() {
   # the droplet's URLs are fixed here and cannot be changed by a restart.
   echo "==> bippass-web"
   cd "$REPO"
+  #
+  # PRERENDER_API_URL is fetched FROM THE BUILD, not from the browser: the public pages
+  # are rendered to static HTML at build time and /pricing needs the real plan rows to
+  # render prices a crawler can see. It is the same public API, reached from here. If it
+  # is unreachable the build still succeeds and logs "plans: unavailable" — /pricing then
+  # prerenders its loading state and the browser fetches on hydrate, exactly as before.
   docker build -f bippass-frontend/Dockerfile \
     --build-arg "PUBLIC_ORIGIN=$PUBLIC_ORIGIN" \
     --build-arg "VITE_API_URL=$API_ORIGIN/api/v1" \
+    --build-arg "PRERENDER_API_URL=$API_ORIGIN/api/v1" \
+    --build-arg "PUBLIC_SITE_ORIGIN=$PUBLIC_ORIGIN" \
     --label "org.opencontainers.image.revision=$fe_rev" \
     -t bippass-web:latest .
 }
@@ -335,6 +343,18 @@ PROVISION
     # got all three wrong — starting with the network, which compose names `bippass`,
     # not the `<project>_default` the convention would suggest.
     ssh "$HOST" "cd $REMOTE && docker compose --profile tools run --rm stripe-prices $action $*"
+    ;;
+
+  paddle-prices)
+    # The Paddle counterpart of `prices`. Same reasoning for `compose run`: it inherits
+    # the .env, the DB_HOST override and the network the API uses.
+    #
+    # Paddle is the DEFAULT provider in production, so this is the catalogue that decides
+    # whether an upgrade works there. Nothing printed is secret — plan names, amounts and
+    # Paddle price ids, none of which is a credential.
+    action=${2:-show}
+    shift 2 2>/dev/null || true
+    ssh "$HOST" "cd $REMOTE && docker compose --profile tools run --rm paddle-prices $action $*"
     ;;
 
   logs)
