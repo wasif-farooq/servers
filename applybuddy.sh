@@ -382,6 +382,34 @@ KEYS
     curl -sS -m 20 -o /dev/null -w "  $API_ORIGIN/health  %{http_code}  cert verify=%{ssl_verify_result}\n" "$API_ORIGIN/health" 2>/dev/null \
       || echo "  no route yet — DNS, then: $SELF expose"
 
+    # Google OAuth, end to end rather than "the endpoint returned 200".
+    #
+    # /api/auth/login returning 200 proves nothing: it only means the app formatted a
+    # URL. Whether Google ACCEPTS that URL depends on the redirect_uri being registered
+    # against the client id, which lives in the .env and is exactly the kind of thing a
+    # deploy gets wrong. This deployment shipped with a dev client whose only registered
+    # callback was http://localhost:3000/... -- green everywhere above, and login 100%
+    # broken. Follow the redirect and let Google answer.
+    echo
+    echo "google oauth:"
+    authurl=$(curl -sS -m 20 "$API_ORIGIN/api/auth/login" 2>/dev/null \
+      | sed -n 's/.*"authorization_url":"\([^"]*\)".*/\1/p')
+    if [ -z "$authurl" ]; then
+      echo "  could not get an authorization_url from $API_ORIGIN/api/auth/login"
+    else
+      loc=$(curl -sS -m 20 -o /dev/null -w '%{redirect_url}' "$authurl" 2>/dev/null)
+      case "$loc" in
+        *signin/oauth/error*)
+          echo "  BROKEN — Google rejected the request (usually redirect_uri_mismatch)."
+          echo "           GOOGLE_CLIENT_ID in $REMOTE/.env must be a client that has"
+          echo "           $FRONTEND_URL/auth/google/callback registered. Fix: $SELF keys" ;;
+        *accountchooser*|*ServiceLogin*|*consent*|*signin/v2*|*signin/v3*)
+          echo "  ok — Google accepted the redirect_uri" ;;
+        "") echo "  no redirect from Google; check connectivity" ;;
+        *)  echo "  unrecognised response: ${loc%%\?*}" ;;
+      esac
+    fi
+
     # The whole point of the memory limit is that ApplyBuddy cannot take BipPass with
     # it, so BipPass's numbers belong in ApplyBuddy's status output.
     echo
