@@ -39,8 +39,30 @@ API_ORIGIN=${API_ORIGIN:-https://api.bippass.com}
 
 IMAGES=(bippass-api bippass-worker bippass-migrate bippass-stripe-prices bippass-paddle-prices bippass-web)
 
+# name=sha for every separate checkout that a backend image is compiled from, comma-joined.
+#
+# The backend is 26 repos, not one: bippass-backend holds the go.work, and core/, app/ and
+# each modules/* are their own checkouts wired in by replace directives. A component with
+# uncommitted changes is stamped +dirty, because that is code baked into the image with no
+# commit behind it and nothing else here would say so.
+component_revs() {
+  local root="$1" out="" d name sha
+  for d in "$root"/core "$root"/app "$root"/modules/*/; do
+    [ -d "$d" ] || continue
+    # Only separate checkouts. A directory that resolves to the root repo is already
+    # covered by the root revision label.
+    top=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || continue
+    [ "$top" = "$root" ] && continue
+    name=$(basename "${d%/}")
+    sha=$(git -C "$d" rev-parse --short HEAD 2>/dev/null || echo unknown)
+    [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ] && sha="$sha+dirty"
+    out="${out:+$out,}$name=$sha"
+  done
+  printf '%s' "$out"
+}
+
 build() {
-  local version be_rev fe_rev
+  local version be_rev fe_rev be_components
   version=$(git -C "$REPO/bippass-backend" describe --tags --always --dirty 2>/dev/null || echo dev)
 
   # The commit each image is built from, stamped as an OCI label so `status` can tell you
@@ -52,6 +74,14 @@ build() {
   be_rev=$(git -C "$REPO/bippass-backend" rev-parse --short HEAD 2>/dev/null || echo unknown)
   fe_rev=$(git -C "$REPO/bippass-frontend" rev-parse --short HEAD 2>/dev/null || echo unknown)
 
+  # The root SHA alone answers the wrong question for the backend. Every module is its own
+  # repo reached through a replace directive, so a module change ships while be_rev is
+  # unchanged — and `status` then says "current" about an image that has just gained new
+  # code. That happened on 2026-08-30: the site-profile passthrough deployed while the
+  # label still read a88e3a3, and only pulling the binary out of the container proved it
+  # was really in there.
+  be_components=$(component_revs "$REPO/bippass-backend")
+
   # api/worker/migrate share one Dockerfile; BINARY picks the cmd. The context is
   # bippass-backend, whose go.work + local replaces are what make the modules resolve —
   # none of them builds alone.
@@ -59,7 +89,8 @@ build() {
   for b in api worker migrate stripe-prices paddle-prices; do
     echo "==> bippass-$b"
     docker build --build-arg "BINARY=$b" --build-arg "VERSION=$version" \
-      --label "org.opencontainers.image.revision=$be_rev" -t "bippass-$b:latest" .
+      --label "org.opencontainers.image.revision=$be_rev" \
+      --label "com.bippass.components=$be_components" -t "bippass-$b:latest" .
   done
 
   # The web build context is the repo PARENT: apps/web depends on @bippass/ui through a
@@ -384,6 +415,8 @@ PROVISION
     running=$(ssh "$HOST" 'for c in bippass-api-1 bippass-web-1; do
         printf "%s %s\n" "$c" "$(docker inspect "$c" --format "{{index .Config.Labels \"org.opencontainers.image.revision\"}}" 2>/dev/null)"
       done' 2>/dev/null)
+    # Fetched in the same trip: the backend's per-component stamp (see component_revs).
+    deployed_components=$(ssh "$HOST" 'docker inspect bippass-api-1 --format "{{index .Config.Labels \"com.bippass.components\"}}" 2>/dev/null' 2>/dev/null)
 
     check_rev() {
       local label="$1" repo="$2" container="$3"
@@ -405,7 +438,51 @@ PROVISION
       fi
     }
 
+    # The 25 checkouts behind the backend image. Only drift is printed: the normal answer
+    # stays one line, and the output gets long exactly when something is wrong.
+    check_components() {
+      local root="$REPO/bippass-backend"
+      local total=0 stale=0 dirty=0 pair name sha now behind report=""
+
+      if [ -z "$deployed_components" ] || [ "$deployed_components" = "<no value>" ]; then
+        printf '  %-9s image predates component tracking — redeploy to start tracking\n' "modules"
+        return
+      fi
+
+      local IFS=,
+      for pair in $deployed_components; do
+        name=${pair%%=*}; sha=${pair#*=}
+        total=$((total + 1))
+        case "$sha" in
+          *+dirty)
+            dirty=$((dirty + 1))
+            report="$report      $name  built from UNCOMMITTED changes (${sha%+dirty})\n"
+            continue
+            ;;
+        esac
+        if [ "$name" = "core" ] || [ "$name" = "app" ]; then
+          now=$(git -C "$root/$name" rev-parse --short HEAD 2>/dev/null || echo "?")
+          behind=$(git -C "$root/$name" rev-list --count "$sha..HEAD" 2>/dev/null || echo "?")
+        else
+          now=$(git -C "$root/modules/$name" rev-parse --short HEAD 2>/dev/null || echo "?")
+          behind=$(git -C "$root/modules/$name" rev-list --count "$sha..HEAD" 2>/dev/null || echo "?")
+        fi
+        [ "$sha" = "$now" ] && continue
+        stale=$((stale + 1))
+        report="$report      $name  deployed $sha · local $now, $behind behind\n"
+      done
+      unset IFS
+
+      if [ "$stale" -eq 0 ] && [ "$dirty" -eq 0 ]; then
+        printf '  %-9s %s tracked — all current\n' "modules" "$total"
+      else
+        printf '  %-9s %s tracked — %s STALE, %s dirty:\n' "modules" "$total" "$stale" "$dirty"
+        printf '%b' "$report"
+      fi
+    }
+
     check_rev "backend" "bippass-backend" "bippass-api-1"
+    check_components
     check_rev "frontend" "bippass-frontend" "bippass-web-1"
     ;;
 
