@@ -15,6 +15,8 @@
 #   ./trackmypocket.sh paddle-key  prompt for the Paddle sandbox keys and store them
 #   ./trackmypocket.sh ai-key      receipt-scanning provider: OpenRouter or OpenCode Zen key
 #                                  (from this machine's env, or a hidden prompt), base URL, model
+#   ./trackmypocket.sh mail-key    turn on real email: Resend SMTP, key from a hidden prompt
+#                                  ON THE SERVER; reports length + prefix only
 #   ./trackmypocket.sh rates       fetch exchange rates once (there is no worker/cron)
 #
 # THIS DROPLET IS BIPPASS'S, and BipPass takes money. Read trackmypocket/docker-compose.yml
@@ -253,9 +255,12 @@ CORS_ORIGINS=${WEB_ORIGIN}
 # Links in emails and Stripe/Paddle return URLs.
 FRONTEND_URL=${WEB_ORIGIN}
 
-# No email provider: MAIL_PROVIDER=console prints each message (including account-deletion
-# confirmation codes) to the API log. Registration, password-reset and 2FA codes are
-# logged as "[Mock Email]" lines regardless — the backend never emails those at all.
+# Email. MAIL_PROVIDER=console sends nothing: every email (verification, password reset,
+# 2FA, invitations, account deletion), codes included, is printed to the API log.
+# Set by: trackmypocket.sh mail-key, which switches to Resend over SMTP
+# (MAIL_PROVIDER=smtp, smtp.resend.com:465, MAIL_USERNAME=resend, MAIL_PASSWORD=the
+# Resend API key). With smtp, codes go only to the inbox and never to the log.
+# The API logs "[EMAIL] Mail provider: ..." at startup; the password is never printed.
 MAIL_PROVIDER=console
 
 # No object storage on staging. The production config refuses to boot without these,
@@ -299,6 +304,7 @@ PROVISION
     echo "  $SELF deploy"
     echo "  $SELF paddle-key     # when the sandbox keys are to hand"
     echo "  $SELF ai-key         # to turn on receipt scanning"
+    echo "  $SELF mail-key       # to send real email (Resend) once the domain is verified"
     ;;
 
   paddle-key)
@@ -454,6 +460,83 @@ PROVISION
     echo "deployed backend predates it (status shows deployed-vs-committed)."
     ;;
 
+  mail-key)
+    require_provisioned
+    # Real email through Resend's SMTP relay. The API key is typed into a hidden prompt ON
+    # THE SERVER and written straight to .env: never an argument (visible in ps), never
+    # this machine's env or shell history, never a chat window. Only its length and
+    # whether it starts with re_ are reported.
+    #
+    # Upserts the whole Resend block (implicit TLS on 465; the username is literally
+    # "resend") so a half-configured .env cannot linger, then recreates tmp-api (env is
+    # read at runtime, no rebuild) and shows the API's own "[EMAIL] Mail provider" line.
+    #
+    # Blank input keeps an existing MAIL_PASSWORD (e.g. to re-apply the settings); with no
+    # key stored yet, nothing changes. The sending domain must be verified in Resend first,
+    # or every send fails (logged by the API with the SMTP error, never the message).
+    ssh -t "$HOST" "cd $REMOTE || exit 1
+      upsert() {
+        tmp=\$(mktemp) || return 1
+        grep -v \"^\$1=\" .env > \"\$tmp\"
+        printf '%s=%s\n' \"\$1\" \"\$2\" >> \"\$tmp\"
+        cat \"\$tmp\" > .env
+        rc=\$?; rm -f \"\$tmp\"; return \$rc
+      }
+      current=\$(sed -n 's/^MAIL_PROVIDER=//p' .env | head -1)
+      echo \"MAIL_PROVIDER is '\${current:-unset}'.\"
+      echo
+
+      read -rsp 'Resend API key  re_… (blank = keep the stored key): ' KEY && echo
+      if [ -z \"\$KEY\" ]; then
+        if ! grep -q '^MAIL_PASSWORD=.' .env; then
+          echo 'no key entered and none stored — nothing changed'
+          exit 1
+        fi
+        echo '  keeping the stored MAIL_PASSWORD'
+      else
+        case \"\$KEY\" in
+          *[[:space:]]*) echo '! the key contains whitespace — nothing stored' >&2; unset KEY; exit 1 ;;
+        esac
+        upsert MAIL_PASSWORD \"\$KEY\" || { unset KEY; exit 1; }
+      fi
+      unset KEY
+
+      upsert MAIL_PROVIDER smtp &&
+      upsert MAIL_HOST smtp.resend.com &&
+      upsert MAIL_PORT 465 &&
+      upsert MAIL_SMTP_SECURE true &&
+      upsert MAIL_USERNAME resend &&
+      upsert MAIL_FROM_ADDRESS noreply@trackmypocket.com &&
+      upsert MAIL_FROM_NAME TrackMyPocket || exit 1
+
+      echo
+      line=\$(grep '^MAIL_PASSWORD=' .env | head -1); val=\${line#*=}
+      case \"\$val\" in
+        re_*) prefix='starts with re_' ;;
+        *)    prefix='! does NOT start with re_ — not a Resend API key?' ;;
+      esac
+      printf '  %-18s %d chars, %s\n' MAIL_PASSWORD \"\${#val}\" \"\$prefix\"
+      unset val line prefix
+      for k in MAIL_PROVIDER MAIL_HOST MAIL_PORT MAIL_SMTP_SECURE MAIL_USERNAME MAIL_FROM_ADDRESS MAIL_FROM_NAME; do
+        printf '  %-18s %s\n' \"\$k\" \"\$(sed -n \"s/^\$k=//p\" .env | head -1)\"
+      done
+
+      echo
+      # up -d, not restart: compose recreates the container because its env changed.
+      echo 'recreating tmp-api…'
+      docker compose up -d tmp-api >/dev/null 2>&1 && echo '  done' || { echo '! docker compose up failed' >&2; exit 1; }
+      # The API's own startup line: provider, host, user, 'password set' (never the value).
+      for i in \$(seq 1 20); do
+        seen=\$(docker compose logs --since 2m tmp-api 2>/dev/null | grep -o '\[EMAIL\] Mail provider:.*' | tail -1)
+        [ -n \"\$seen\" ] && break
+        sleep 3
+      done
+      echo \"  \${seen:-no '[EMAIL] Mail provider' line yet — check: $SELF logs tmp-api}\""
+    echo
+    echo "to test: register with an address you can read, or use 'Forgot password' on"
+    echo "$WEB_ORIGIN. A failed send appears in '$SELF logs tmp-api' as '[EMAIL] ... not sent: <reason>'."
+    ;;
+
   build)
     build
     docker images --filter=reference='trackmypocket-*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
@@ -603,7 +686,7 @@ PROVISION
     ;;
 
   *)
-    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|ai-key|rates]" >&2
+    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|ai-key|mail-key|rates]" >&2
     exit 2
     ;;
 esac
