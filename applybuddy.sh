@@ -356,12 +356,12 @@ KEYS
 
   admin)
     require_provisioned
-    ssh -t "$HOST" "cd $REMOTE && docker compose exec api python manage.py createsuperuser"
+    ssh -t "$HOST" "cd $REMOTE && docker compose exec applybuddy-api python manage.py createsuperuser"
     ;;
 
   shell-py)
     require_provisioned
-    ssh -t "$HOST" "cd $REMOTE && docker compose exec api python manage.py shell"
+    ssh -t "$HOST" "cd $REMOTE && docker compose exec applybuddy-api python manage.py shell"
     ;;
 
   logs)
