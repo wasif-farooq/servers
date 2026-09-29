@@ -13,6 +13,8 @@
 #                                  memory, deployed-vs-committed
 #   ./trackmypocket.sh logs [svc]  tail the logs (tmp-api, tmp-web, tmp-migrate)
 #   ./trackmypocket.sh paddle-key  prompt for the Paddle sandbox keys and store them
+#   ./trackmypocket.sh ai-key      store OPENCODE_API_KEY (receipt scanning), from this
+#                                  machine's environment or a hidden prompt
 #   ./trackmypocket.sh rates       fetch exchange rates once (there is no worker/cron)
 #
 # THIS DROPLET IS BIPPASS'S, and BipPass takes money. Read trackmypocket/docker-compose.yml
@@ -272,6 +274,11 @@ PADDLE_ENV=sandbox
 PADDLE_API_KEY=
 PADDLE_CLIENT_TOKEN=
 PADDLE_WEBHOOK_SECRET=
+
+# AI receipt scanning (OpenCode Zen). Set by: trackmypocket.sh ai-key. Empty = the scan
+# endpoints answer 503 and the apps fall back to manual entry; the app still boots.
+# Optional overrides: AI_BASE_URL, AI_RECEIPT_MODEL (default mimo-v2.5-free).
+OPENCODE_API_KEY=
 EOF
 chmod 600 "$REMOTE/.env"
 echo "wrote $REMOTE/.env (0600)"
@@ -287,6 +294,7 @@ PROVISION
     echo "provisioned. next:"
     echo "  $SELF deploy"
     echo "  $SELF paddle-key     # when the sandbox keys are to hand"
+    echo "  $SELF ai-key         # to turn on receipt scanning"
     ;;
 
   paddle-key)
@@ -368,6 +376,55 @@ PROVISION
       else
         echo 'nothing changed'
       fi"
+    ;;
+
+  ai-key)
+    require_provisioned
+    # The key never travels as an argument (visible in ps on either machine) and never
+    # passes through a chat window. Two ways in:
+    #   - OPENCODE_API_KEY is set on this machine: offered, then piped over ssh STDIN;
+    #   - otherwise: a hidden prompt on the SERVER, as paddle-key does.
+    # Either way it is upserted into .env and only its length is reported. The API reads
+    # it at runtime, so tmp-api is recreated; no rebuild.
+    AI_REMOTE="cd $REMOTE || exit 1
+      upsert() {
+        tmp=\$(mktemp) || return 1
+        grep -v \"^\$1=\" .env > \"\$tmp\"
+        printf '%s=%s\n' \"\$1\" \"\$2\" >> \"\$tmp\"
+        cat \"\$tmp\" > .env
+        rc=\$?; rm -f \"\$tmp\"; return \$rc
+      }
+      store() {
+        if [ -z \"\$KEY\" ]; then echo 'nothing entered — OPENCODE_API_KEY unchanged'; return 0; fi
+        case \"\$KEY\" in
+          *[[:space:]]*) echo '! the key contains whitespace — not stored' >&2; return 1 ;;
+        esac
+        upsert OPENCODE_API_KEY \"\$KEY\" || return 1
+        line=\$(grep '^OPENCODE_API_KEY=' .env | head -1); val=\${line#*=}
+        printf '  OPENCODE_API_KEY stored (%d chars)\n' \"\${#val}\"
+        unset KEY val line
+        model=\$(sed -n 's/^AI_RECEIPT_MODEL=//p' .env | head -1)
+        echo \"  AI_RECEIPT_MODEL \${model:-unset (default mimo-v2.5-free)}\"
+        echo 'restarting tmp-api…'
+        docker compose up -d tmp-api >/dev/null 2>&1 && echo '  done'
+      }"
+    use_local=n
+    if [ -n "${OPENCODE_API_KEY:-}" ]; then
+      read -rp "Use OPENCODE_API_KEY from this machine? [Y/n] " answer
+      case "${answer:-y}" in [Yy]*) use_local=y ;; esac
+    fi
+    if [ "$use_local" = y ]; then
+      printf '%s\n' "$OPENCODE_API_KEY" | ssh "$HOST" "$AI_REMOTE
+        IFS= read -r KEY
+        store"
+    else
+      ssh -t "$HOST" "$AI_REMOTE
+        read -rsp 'OpenCode API key (blank = leave unchanged): ' KEY && echo
+        store"
+    fi
+    echo
+    echo "receipt scanning needs migration 032 on the database: run $SELF deploy if the"
+    echo "deployed backend predates it (status shows deployed-vs-committed)."
     ;;
 
   build)
@@ -519,7 +576,7 @@ PROVISION
     ;;
 
   *)
-    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|rates]" >&2
+    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|ai-key|rates]" >&2
     exit 2
     ;;
 esac
