@@ -13,8 +13,8 @@
 #                                  memory, deployed-vs-committed
 #   ./trackmypocket.sh logs [svc]  tail the logs (tmp-api, tmp-web, tmp-migrate)
 #   ./trackmypocket.sh paddle-key  prompt for the Paddle sandbox keys and store them
-#   ./trackmypocket.sh ai-key      store OPENCODE_API_KEY (receipt scanning), from this
-#                                  machine's environment or a hidden prompt
+#   ./trackmypocket.sh ai-key      receipt-scanning provider: OpenRouter or OpenCode Zen key
+#                                  (from this machine's env, or a hidden prompt), base URL, model
 #   ./trackmypocket.sh rates       fetch exchange rates once (there is no worker/cron)
 #
 # THIS DROPLET IS BIPPASS'S, and BipPass takes money. Read trackmypocket/docker-compose.yml
@@ -275,10 +275,12 @@ PADDLE_API_KEY=
 PADDLE_CLIENT_TOKEN=
 PADDLE_WEBHOOK_SECRET=
 
-# AI receipt scanning (OpenCode Zen). Set by: trackmypocket.sh ai-key. Empty = the scan
-# endpoints answer 503 and the apps fall back to manual entry; the app still boots.
-# Optional overrides: AI_BASE_URL, AI_RECEIPT_MODEL (default mimo-v2.5-free).
-OPENCODE_API_KEY=
+# AI receipt scanning. Set by: trackmypocket.sh ai-key. No key = the scan endpoints
+# answer 503 and the apps fall back to manual entry; the app still boots.
+# Free models may log inputs (receipts are personal data): staging/testing only.
+AI_BASE_URL=https://openrouter.ai/api/v1
+AI_RECEIPT_MODEL=nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+OPENROUTER_API_KEY=
 EOF
 chmod 600 "$REMOTE/.env"
 echo "wrote $REMOTE/.env (0600)"
@@ -380,12 +382,28 @@ PROVISION
 
   ai-key)
     require_provisioned
-    # The key never travels as an argument (visible in ps on either machine) and never
-    # passes through a chat window. Two ways in:
-    #   - OPENCODE_API_KEY is set on this machine: offered, then piped over ssh STDIN;
-    #   - otherwise: a hidden prompt on the SERVER, as paddle-key does.
-    # Either way it is upserted into .env and only its length is reported. The API reads
-    # it at runtime, so tmp-api is recreated; no rebuild.
+    # Receipt scanning provider. Asks which provider, then:
+    #   - the key: this machine's env var for that provider is offered and piped over ssh
+    #     STDIN (never an argument, visible in ps on either machine); otherwise a hidden
+    #     prompt on the SERVER, as paddle-key does;
+    #   - AI_BASE_URL and AI_RECEIPT_MODEL (not secret, shown and confirmable).
+    # All are upserted into .env and only the key's length is reported. The API reads them
+    # at runtime, so tmp-api is recreated; no rebuild.
+    echo "Receipt scanning provider:"
+    echo "  1) OpenRouter    (default model: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free — testing only)"
+    echo "  2) OpenCode Zen  (needs a funded balance; its free models refuse server calls)"
+    read -rp "Provider [1]: " choice
+    case "${choice:-1}" in
+      2) key_var=OPENCODE_API_KEY; base_url=https://opencode.ai/zen/v1; model=gemini-3-flash ;;
+      *) key_var=OPENROUTER_API_KEY; base_url=https://openrouter.ai/api/v1
+         model=nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free ;;
+    esac
+    read -rp "Model [$model]: " model_in
+    model=${model_in:-$model}
+    case "$model$base_url" in
+      *[[:space:]\'\"\$\`\\]*) echo "! model or URL contains characters that are not allowed" >&2; exit 1 ;;
+    esac
+
     AI_REMOTE="cd $REMOTE || exit 1
       upsert() {
         tmp=\$(mktemp) || return 1
@@ -395,31 +413,38 @@ PROVISION
         rc=\$?; rm -f \"\$tmp\"; return \$rc
       }
       store() {
-        if [ -z \"\$KEY\" ]; then echo 'nothing entered — OPENCODE_API_KEY unchanged'; return 0; fi
-        case \"\$KEY\" in
-          *[[:space:]]*) echo '! the key contains whitespace — not stored' >&2; return 1 ;;
-        esac
-        upsert OPENCODE_API_KEY \"\$KEY\" || return 1
-        line=\$(grep '^OPENCODE_API_KEY=' .env | head -1); val=\${line#*=}
-        printf '  OPENCODE_API_KEY stored (%d chars)\n' \"\${#val}\"
-        unset KEY val line
-        model=\$(sed -n 's/^AI_RECEIPT_MODEL=//p' .env | head -1)
-        echo \"  AI_RECEIPT_MODEL \${model:-unset (default mimo-v2.5-free)}\"
+        upsert AI_BASE_URL '$base_url' && upsert AI_RECEIPT_MODEL '$model' || return 1
+        if [ -n \"\$KEY\" ]; then
+          case \"\$KEY\" in
+            *[[:space:]]*) echo '! the key contains whitespace — not stored' >&2; return 1 ;;
+          esac
+          upsert $key_var \"\$KEY\" || return 1
+        else
+          echo '  no key entered — $key_var unchanged'
+        fi
+        unset KEY
+        line=\$(grep '^$key_var=' .env | head -1); val=\${line#*=}
+        if [ -n \"\$val\" ]; then printf '  %-19s stored (%d chars)\n' $key_var \"\${#val}\"
+        else printf '  %-19s EMPTY — scanning answers 503 until it is set\n' $key_var; fi
+        unset val line
+        printf '  %-19s %s\n' AI_BASE_URL '$base_url' AI_RECEIPT_MODEL '$model'
+        if grep -q '^AI_API_KEY=.' .env; then echo '  ! AI_API_KEY is set and wins over $key_var'; fi
         echo 'restarting tmp-api…'
         docker compose up -d tmp-api >/dev/null 2>&1 && echo '  done'
       }"
+
     use_local=n
-    if [ -n "${OPENCODE_API_KEY:-}" ]; then
-      read -rp "Use OPENCODE_API_KEY from this machine? [Y/n] " answer
+    if [ -n "${!key_var:-}" ]; then
+      read -rp "Use $key_var from this machine? [Y/n] " answer
       case "${answer:-y}" in [Yy]*) use_local=y ;; esac
     fi
     if [ "$use_local" = y ]; then
-      printf '%s\n' "$OPENCODE_API_KEY" | ssh "$HOST" "$AI_REMOTE
+      printf '%s\n' "${!key_var}" | ssh "$HOST" "$AI_REMOTE
         IFS= read -r KEY
         store"
     else
       ssh -t "$HOST" "$AI_REMOTE
-        read -rsp 'OpenCode API key (blank = leave unchanged): ' KEY && echo
+        read -rsp '$key_var (blank = leave unchanged): ' KEY && echo
         store"
     fi
     echo
