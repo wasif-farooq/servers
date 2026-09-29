@@ -17,6 +17,7 @@
 #                                  (from this machine's env, or a hidden prompt), base URL, model
 #   ./trackmypocket.sh mail-key    turn on real email: Resend SMTP, key from a hidden prompt
 #                                  ON THE SERVER; reports length + prefix only
+#   ./trackmypocket.sh google-key  Sign in with Google: client ids + the web client secret
 #   ./trackmypocket.sh rates       fetch exchange rates once (there is no worker/cron)
 #
 # THIS DROPLET IS BIPPASS'S, and BipPass takes money. Read trackmypocket/docker-compose.yml
@@ -64,6 +65,14 @@ API_ORIGIN=https://$API_HOST
 
 IMAGES=(trackmypocket-api trackmypocket-web)
 
+# Google OAuth clients in the "trackmypocket" Google Cloud project (wasiffarooq1122@gmail.com).
+# Client ids are public; only the web client's SECRET is sensitive (see google-key).
+#   web: authorization-code flow for trackmypocket.com (redirect /auth/google/callback)
+#   ios: bundle com.trackmypocket.app. Android needs the signing cert's SHA-1, so it is
+#        added once EAS/Play signing exists.
+GOOGLE_WEB_CLIENT_ID=48929835109-0e9b61jmjvfphqmp438cs9p4onkbg13e.apps.googleusercontent.com
+GOOGLE_IOS_CLIENT_ID=48929835109-c6kui8p0eqislorbq9rbktpa218ro6l7.apps.googleusercontent.com
+
 # Refuse to ship unless the server keeps this much free after the load. Measured unpacked:
 # api ~320 MB + web ~66 MB. The disk was 92% full (2.1 GB free) when this was written.
 MIN_FREE_MB=800
@@ -97,7 +106,8 @@ build() {
     -t trackmypocket-api:latest "$BE_REPO"
 
   # VITE_* are inlined at build time, so the droplet's URLs are fixed here and a restart
-  # cannot change them. No Google client id: sign-in with Google is hidden on staging.
+  # cannot change them. The Google client id is public (it ships in every bundle); without
+  # it the web app hides "Continue with Google".
   #
   # @wasif-farooq/ui needs a GitHub Packages token. It goes in as a BuildKit SECRET read
   # from this one command's environment: never a build arg (those are in `docker history`),
@@ -107,6 +117,7 @@ build() {
     --secret id=node_auth_token,env=NODE_AUTH_TOKEN \
     --build-arg "VITE_API_URL=$API_ORIGIN/api/v1" \
     --build-arg "VITE_FRONTEND_URL=$WEB_ORIGIN" \
+    --build-arg "VITE_GOOGLE_CLIENT_ID=$GOOGLE_WEB_CLIENT_ID" \
     --build-arg "VITE_GOOGLE_REDIRECT_URI=$WEB_ORIGIN/auth/google/callback" \
     --label "org.opencontainers.image.revision=$fe_rev" \
     -t trackmypocket-web:latest "$FE_REPO"
@@ -537,6 +548,61 @@ PROVISION
     echo "$WEB_ORIGIN. A failed send appears in '$SELF logs tmp-api' as '[EMAIL] ... not sent: <reason>'."
     ;;
 
+  google-key)
+    require_provisioned
+    # Sign in with Google. Writes the web client id, its redirect URI and the mobile client
+    # ids (all public) plus the web client SECRET into .env, then recreates tmp-api.
+    #
+    # The secret comes from GOOGLE_CLIENT_SECRET in the backend repo's local .env (the same
+    # web client is used for local dev) or, failing that, a hidden prompt ON THE SERVER. It
+    # travels over ssh STDIN, never as an argument, and only its length is reported. Google
+    # no longer shows existing secrets; if it is lost, add a new one on the client in the
+    # Cloud console and paste it at the prompt.
+    #
+    # The web image must be built with VITE_GOOGLE_CLIENT_ID for the button to show: that
+    # is what `deploy` does (see build()).
+    local_secret=$(sed -n 's/^GOOGLE_CLIENT_SECRET=//p' "$BE_REPO/.env" 2>/dev/null | head -1 | tr -d "\"'" || true)
+    GOOGLE_REMOTE="cd $REMOTE || exit 1
+      upsert() {
+        tmp=\$(mktemp) || return 1
+        grep -v \"^\$1=\" .env > \"\$tmp\"
+        printf '%s=%s\n' \"\$1\" \"\$2\" >> \"\$tmp\"
+        cat \"\$tmp\" > .env
+        rc=\$?; rm -f \"\$tmp\"; return \$rc
+      }
+      store() {
+        if [ -n \"\$SECRET\" ]; then
+          case \"\$SECRET\" in *[[:space:]]*) echo '! the secret contains whitespace — not stored' >&2; return 1 ;; esac
+          upsert GOOGLE_CLIENT_SECRET \"\$SECRET\" || return 1
+        elif ! grep -q '^GOOGLE_CLIENT_SECRET=.' .env; then
+          echo 'no secret given and none stored — nothing changed' >&2; return 1
+        fi
+        unset SECRET
+        upsert GOOGLE_CLIENT_ID '$GOOGLE_WEB_CLIENT_ID' &&
+        upsert GOOGLE_REDIRECT_URI '$WEB_ORIGIN/auth/google/callback' &&
+        upsert GOOGLE_MOBILE_CLIENT_IDS '$GOOGLE_IOS_CLIENT_ID' || return 1
+        line=\$(grep '^GOOGLE_CLIENT_SECRET=' .env | head -1); val=\${line#*=}
+        printf '  %-25s %d chars\n' GOOGLE_CLIENT_SECRET \"\${#val}\"
+        unset val line
+        for k in GOOGLE_CLIENT_ID GOOGLE_REDIRECT_URI GOOGLE_MOBILE_CLIENT_IDS; do
+          printf '  %-25s %s\n' \"\$k\" \"\$(sed -n \"s/^\$k=//p\" .env | head -1)\"
+        done
+        echo 'recreating tmp-api…'
+        docker compose up -d tmp-api >/dev/null 2>&1 && echo '  done'
+      }"
+    if [ -n "$local_secret" ]; then
+      echo "using GOOGLE_CLIENT_SECRET from $BE_REPO/.env (${#local_secret} chars)"
+      printf '%s\n' "$local_secret" | ssh "$HOST" "$GOOGLE_REMOTE
+        IFS= read -r SECRET
+        store"
+    else
+      ssh -t "$HOST" "$GOOGLE_REMOTE
+        read -rsp 'Google web client secret (blank = keep the stored one): ' SECRET && echo
+        store"
+    fi
+    unset local_secret
+    ;;
+
   build)
     build
     docker images --filter=reference='trackmypocket-*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
@@ -686,7 +752,7 @@ PROVISION
     ;;
 
   *)
-    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|ai-key|mail-key|rates]" >&2
+    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|ai-key|mail-key|google-key|rates]" >&2
     exit 2
     ;;
 esac
