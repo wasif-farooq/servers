@@ -1,0 +1,76 @@
+# ── TrackMyPocket (staging) ───────────────────────────────────────────────────
+#
+# A fourth co-tenant on this droplet: its own compose project (`trackmypocket`, at
+# /srv/trackmypocket) joined to this one's network, deployed by
+# ~/servers/trackmypocket.sh. The blocks live HERE, in the BipPass repo, for the same
+# reason as ApplyBuddy's: `bippass.sh deploy` scp's this file over the server's copy, so
+# a block added only on the server would vanish at the next BipPass deploy.
+#
+# Upstreams are `tmp-web` and `tmp-api`, never `web` / `api`. Compose registers every
+# SERVICE KEY as a DNS name on the shared network (container_name and aliases are added
+# to it, they do not replace it), so TrackMyPocket's compose file prefixes the service
+# keys themselves. `web:80` and `api:8080` above still mean BipPass's containers.
+#
+# CLOUDFLARE. Both names are PROXIED (orange cloud), unlike bippass.com. The zone's
+# SSL/TLS mode must be Full (strict). Flexible makes Cloudflare fetch the origin over
+# plain HTTP, Caddy answers that with its HTTP→HTTPS redirect, and the browser loops
+# forever. Full (strict) makes Cloudflare validate the Let's Encrypt certificate Caddy
+# obtains here. HTTP-01 issuance works through the proxy provided Cloudflare passes
+# http://<name>/.well-known/acme-challenge/ through to :80 unredirected (TLS-ALPN-01 cannot
+# work behind the proxy at all). If the first certificate does not arrive — watch
+# `docker compose logs caddy` in /srv/bippass — check "Always Use HTTPS" / redirect rules
+# for that path, or grey-cloud the record until the first issuance, then turn it orange.
+#
+# NOINDEX. This is a staging copy on the real domain, so every response from both names
+# carries X-Robots-Tag: noindex. Deliberately NOT a robots.txt "Disallow": a crawler that
+# is blocked never fetches the page, never sees the noindex, and can still index the bare
+# URL from inbound links. It lives here, in the edge config for this environment, rather
+# than in the app, so a production deploy does not inherit it — delete these two lines
+# when trackmypocket.com goes live.
+trackmypocket.com {
+	header X-Robots-Tag "noindex, nofollow"
+
+	# A fallback only: nginx serves precompressed .gz files and Caddy passes an
+	# already-encoded response through untouched.
+	encode zstd gzip
+
+	# nginx owns the cache headers (immutable /assets, no-cache index.html).
+	reverse_proxy tmp-web:80
+}
+
+api.trackmypocket.com {
+	header X-Robots-Tag "noindex, nofollow"
+
+	# Generated JSON. Express also compresses, so for most responses this passes
+	# through; it covers anything Express leaves uncompressed.
+	encode zstd gzip
+
+	# Prometheus metrics are mounted on the public app with no auth. They are not an
+	# API anyone outside needs.
+	respond /metrics 404
+
+	# CLIENT IP. Rate limiting (10 logins / 15 min per IP) keys on Express's req.ip, and
+	# the path is client → Cloudflare edge → Caddy → tmp-api. Two pieces make req.ip the
+	# real client:
+	#
+	#   trusted_proxies (here)  By default Caddy does not trust an incoming
+	#                           X-Forwarded-For: it REPLACES it with the peer address,
+	#                           which is a Cloudflare edge. Trusting Cloudflare's ranges
+	#                           makes Caddy keep the header Cloudflare set and append the
+	#                           edge: "client, edge". Verified locally with caddy 2.11.
+	#   TRUST_PROXY=2 (.env)    Express then skips two hops from the right — Caddy's own
+	#                           address and the edge — and lands on the client.
+	#
+	# Spoofing: a request that reaches the origin directly (165.22.176.141 with this SNI,
+	# bypassing Cloudflare) comes from an untrusted address, so Caddy overwrites whatever
+	# X-Forwarded-For it carries with the real peer IP. The residual gap is traffic
+	# originating INSIDE Cloudflare's ranges (e.g. a Worker's subrequest), which is
+	# trusted like any edge; Authenticated Origin Pulls would close it.
+	#
+	# If Cloudflare adds a range that is missing here, requests through it degrade to
+	# the edge IP (shared rate-limit bucket), never to a spoofable one. Current list:
+	# https://www.cloudflare.com/ips-v4 and /ips-v6 (fetched 2026-09-29).
+	reverse_proxy tmp-api:3000 {
+		trusted_proxies 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+	}
+}

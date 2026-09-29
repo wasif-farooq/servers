@@ -1,0 +1,130 @@
+# TrackMyPocket (staging) — co-tenanted on BipPass's droplet, 165.22.176.141.
+#
+# Shipped to /srv/trackmypocket by ~/servers/trackmypocket.sh. Images are built on the
+# workstation and loaded over SSH, as for BipPass: no registry, no source on the server.
+# /srv/trackmypocket holds this file and a generated .env, nothing else.
+#
+# ── This box is not ours alone ────────────────────────────────────────────────
+#
+# BipPass takes money. The same three rules as ApplyBuddy and LinkedIn Poster:
+#
+#   * A separate compose project (`trackmypocket`) joined to BipPass's network as an
+#     EXTERNAL network. Nothing in BipPass's compose file changes, and nothing here can
+#     create or remove that network.
+#
+#   * Every SERVICE KEY is prefixed, not just the container name. Compose registers the
+#     service key as a DNS name on every network the service joins — verified with
+#     compose v5.1.4: a service `api` with container_name `x-api` and alias `x-alias`
+#     answers to all three of `api`, `x-api` and `x-alias`. BipPass already has services
+#     called `api`, `web` and `migrate` on this network, so an unprefixed key here would
+#     make Caddy's `reverse_proxy api:8080` (and `web:80`) resolve to two containers and
+#     send a share of bippass.com's traffic into this project. So the keys, the container
+#     names and therefore every DNS name this file puts on `bippass` are tmp-*:
+#
+#         tmp-api  → the API        (Caddy: api.trackmypocket.com → tmp-api:3000)
+#         tmp-web  → the static SPA (Caddy: trackmypocket.com     → tmp-web:80)
+#         tmp-migrate  one-shot, exits; while it runs it answers to tmp-migrate only
+#
+#   * Hard memory limits, so a runaway here is killed inside its own cgroup instead of
+#     taking BipPass with it.
+#
+# ── Borrowed from BipPass ─────────────────────────────────────────────────────
+#
+# postgres  BipPass's postgres:15 (service `postgres`, container bippass-postgres-1).
+#           TrackMyPocket has its own non-superuser role and database, `trackmypocket`,
+#           created by `trackmypocket.sh provision`, with a connection limit so it cannot
+#           exhaust BipPass's max_connections=50.
+# redis     BipPass's redis:7 (service `redis`), DB index 1 (REDIS_DB). No password, and
+#           maxmemory 32mb allkeys-lru is SHARED across all DB indexes — see the .env
+#           comments on ACTIVITY_LOG_ENABLED for why TrackMyPocket keeps its footprint
+#           near zero.
+#
+# ── Sizing ────────────────────────────────────────────────────────────────────
+#
+# The droplet is 1 vCPU / 957 MB with ~388 MB available and swap already in use. Limits
+# are ceilings, not reservations. Measured locally (2026-09-29) against a stand-in with
+# BipPass's exact postgres/redis settings:
+#
+#   tmp-api   ~37 MiB idle; 70–83 MiB after register/verify/login plus 900 requests;
+#             peak RSS 95 MB. Limit 256M, V8 heap capped at 160 MB so V8 collects hard
+#             long before the cgroup would kill it, with ~96 MB left for native memory.
+#   tmp-web   nginx, one worker: 3–4 MiB. Limit 32M.
+#
+# Realistic footprint on the box is therefore ~100 MB, against ~388 MB available.
+#
+# Only the API process runs — processes/api-gateway in "direct" mode, as `pnpm dev:api`
+# does. No Kafka, no MinIO, no worker: see the .env comments for what that disables.
+
+name: trackmypocket
+
+services:
+  # Runs to completion before the API starts, so the API never serves traffic against an
+  # unmigrated schema. `docker compose up -d` honours that; `restart tmp-api` would not.
+  #
+  # node-pg-migrate reads DATABASE_URL. It is assembled here from the same DB_* values the
+  # API reads, so the password lives in the .env exactly once. $$ defers expansion to the
+  # container's shell; compose would otherwise substitute it at parse time.
+  tmp-migrate:
+    image: trackmypocket-api:latest
+    container_name: tmp-migrate
+    env_file: [.env]
+    command:
+      - sh
+      - -c
+      - DATABASE_URL="postgres://$${DB_USER}:$${DB_PASSWORD}@$${DB_HOST}:$${DB_PORT:-5432}/$${DB_NAME}" exec node-pg-migrate up
+    # postgres belongs to another compose project, so there is no depends_on on it. If it
+    # is not up yet, this exits non-zero and tmp-api (which depends on success) does not
+    # start; re-run `docker compose up -d`.
+    restart: 'no'
+    deploy:
+      resources:
+        limits: { memory: 128M }
+    networks: [bippass]
+
+  tmp-api:
+    image: trackmypocket-api:latest
+    container_name: tmp-api
+    env_file: [.env]
+    environment:
+      # Heap cap below the cgroup limit, so V8 garbage-collects hard before the kernel
+      # OOM-kills the container. Node's own default would size the heap from the host's
+      # 957 MB, not from this limit.
+      NODE_OPTIONS: --max-old-space-size=160
+    depends_on:
+      tmp-migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
+    # No host port. Caddy reaches this over the shared network and is the only thing
+    # listening on the public interface.
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3000/health']
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits: { memory: 256M }
+    networks: [bippass]
+
+  # Static nginx. Its API base URL is baked in at BUILD time — changing it means a rebuild
+  # and a re-ship, not a restart.
+  tmp-web:
+    image: trackmypocket-web:latest
+    container_name: tmp-web
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1/healthz']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits: { memory: 32M }
+    networks: [bippass]
+
+networks:
+  # BipPass's network, created by its compose project (`name: bippass` there). External
+  # on purpose: this file must never be the thing that creates or destroys it.
+  bippass:
+    name: bippass
+    external: true
