@@ -111,7 +111,9 @@ build() {
 }
 
 require_provisioned() {
-  ssh "$HOST" "test -f $REMOTE/.env" || {
+  # -n: never read stdin. Without it this probe swallows input meant for the prompts that
+  # follow (ai-key, paddle-key), and the next `read` hits EOF under set -e: exit 1, nothing stored.
+  ssh -n "$HOST" "test -f $REMOTE/.env" || {
     echo "not provisioned yet — run: $SELF provision" >&2
     exit 1
   }
