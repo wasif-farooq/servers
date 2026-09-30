@@ -18,7 +18,9 @@
 #   ./trackmypocket.sh mail-key    turn on real email: Resend SMTP, key from a hidden prompt
 #                                  ON THE SERVER; reports length + prefix only
 #   ./trackmypocket.sh google-key  Sign in with Google: client ids + the web client secret
-#   ./trackmypocket.sh rates       fetch exchange rates once (there is no worker/cron)
+#   ./trackmypocket.sh rates       fetch exchange rates once
+#   ./trackmypocket.sh cron        install the server's rate schedule (crypto every 10 min,
+#                                  fiat + crypto daily 02:15 UTC); `cron remove` uninstalls
 #
 # THIS DROPLET IS BIPPASS'S, and BipPass takes money. Read trackmypocket/docker-compose.yml
 # next to this script for the three rules that keep one from taking down the other: a
@@ -681,6 +683,29 @@ PROVISION
     ssh "$HOST" "cd $REMOTE && docker compose run --rm --no-deps tmp-api node dist/src/cli/exchange-rates.cli.js fetch"
     ;;
 
+  cron)
+    # The worker (whose scheduler refreshes rates) is not deployed: the droplet has no
+    # memory to spare. Host cron runs the rates CLI instead. `docker exec` into the running
+    # tmp-api rather than `compose run`, so no container is created every 10 minutes; the
+    # CLI shares tmp-api's cgroup (API ~65 MB of 256 MB). Output goes to journald
+    # (`journalctl -t tmp-rates`), which rotates it. A stopped tmp-api just skips a run.
+    require_provisioned
+    if [ "${2:-}" = remove ]; then
+      ssh "$HOST" "rm -f /etc/cron.d/trackmypocket-rates && echo 'removed /etc/cron.d/trackmypocket-rates'"
+      exit 0
+    fi
+    ssh "$HOST" "cat > /etc/cron.d/trackmypocket-rates && chmod 644 /etc/cron.d/trackmypocket-rates && echo 'installed /etc/cron.d/trackmypocket-rates:' && cat /etc/cron.d/trackmypocket-rates" <<'CRON'
+# Managed by ~/servers/trackmypocket.sh cron — edits here are overwritten.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CLI="node dist/src/cli/exchange-rates.cli.js"
+# Crypto prices (CoinGecko, one call for all coins).
+*/10 * * * * root docker exec tmp-api $CLI fetch:crypto 2>&1 | logger -t tmp-rates
+# Fiat for USD/EUR/GBP bases (plus crypto), once a day.
+15 2 * * * root docker exec tmp-api $CLI fetch 2>&1 | logger -t tmp-rates
+CRON
+    ;;
+
   logs)
     ssh "$HOST" "cd $REMOTE && docker compose logs -f --tail=200 ${2:-}"
     ;;
@@ -752,7 +777,7 @@ PROVISION
     ;;
 
   *)
-    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|ai-key|mail-key|google-key|rates]" >&2
+    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|ai-key|mail-key|google-key|rates|cron [remove]]" >&2
     exit 2
     ;;
 esac
