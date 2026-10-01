@@ -20,6 +20,8 @@
 #   ./trackmypocket.sh google-key  Sign in with Google: client ids + the web client secret
 #   ./trackmypocket.sh conn-key    connected accounts: generate CONNECTIONS_ENC_KEYS ON THE
 #                                  SERVER (once; never replaces an existing key)
+#   ./trackmypocket.sh etherscan-key  Ethereum + EVM wallets: key from this machine's env
+#                                  (ETHERSCAN_API_KEY) or a hidden prompt ON THE SERVER
 #   ./trackmypocket.sh flag <key> [on|off]  show or set a remote feature flag
 #   ./trackmypocket.sh rates       fetch exchange rates once
 #   ./trackmypocket.sh cron        install the server's schedule (crypto rates every 10 min,
@@ -581,6 +583,38 @@ PROVISION
       # up -d, not restart: compose recreates the container because its env changed.
       echo 'recreating tmp-api…'
       docker compose up -d tmp-api >/dev/null 2>&1 && echo '  done' || { echo '! docker compose up failed' >&2; exit 1; }"
+    ;;
+
+  etherscan-key)
+    require_provisioned
+    # Connected accounts: ETHERSCAN_API_KEY turns on Ethereum and the other EVM chains
+    # (Etherscan V2, one key for every chain). This machine's ETHERSCAN_API_KEY is piped
+    # over ssh STDIN (never an argument); otherwise a hidden prompt on the SERVER. Only
+    # its length is reported. Read at startup, so tmp-api is recreated; no rebuild.
+    ES_REMOTE="cd $REMOTE || exit 1
+      store() {
+        [ -n \"\$KEY\" ] || { echo 'no key entered — nothing changed'; return 1; }
+        case \"\$KEY\" in *[[:space:]]*) echo '! the key contains whitespace — not stored' >&2; unset KEY; return 1 ;; esac
+        tmp=\$(mktemp) || return 1
+        grep -v '^ETHERSCAN_API_KEY=' .env > \"\$tmp\"
+        printf 'ETHERSCAN_API_KEY=%s\n' \"\$KEY\" >> \"\$tmp\"
+        cat \"\$tmp\" > .env; rc=\$?; rm -f \"\$tmp\"; unset KEY
+        [ \$rc -eq 0 ] || { echo '! could not write .env' >&2; return 1; }
+        line=\$(grep '^ETHERSCAN_API_KEY=' .env | head -1); val=\${line#*=}
+        printf '  ETHERSCAN_API_KEY stored (%d chars)\n' \"\${#val}\"; unset val line
+        echo 'recreating tmp-api…'
+        docker compose up -d tmp-api >/dev/null 2>&1 && echo '  done' || { echo '! docker compose up failed' >&2; return 1; }
+      }"
+    if [ -n "${ETHERSCAN_API_KEY:-}" ]; then
+      echo "using ETHERSCAN_API_KEY from this machine"
+      printf '%s\n' "$ETHERSCAN_API_KEY" | ssh "$HOST" "$ES_REMOTE
+        IFS= read -r KEY
+        store"
+    else
+      ssh -t "$HOST" "$ES_REMOTE
+        read -rsp 'ETHERSCAN_API_KEY: ' KEY && echo
+        store"
+    fi
     ;;
 
   flag)
