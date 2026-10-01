@@ -24,7 +24,7 @@
 #                                  (ETHERSCAN_API_KEY) or a hidden prompt ON THE SERVER
 #   ./trackmypocket.sh flag <key> [on|off]  show or set a remote feature flag
 #   ./trackmypocket.sh rates       fetch exchange rates once
-#   ./trackmypocket.sh cron        install the server's schedule (crypto rates every 10 min,
+#   ./trackmypocket.sh cron        install the server's schedule (crypto rates hourly at :02,
 #                                  fiat + crypto daily 02:15 UTC, connected-account sync
 #                                  hourly at :07); `cron remove` uninstalls
 #
@@ -768,7 +768,7 @@ PROVISION
   cron)
     # The worker (whose scheduler refreshes rates) is not deployed: the droplet has no
     # memory to spare. Host cron runs the rates CLI instead. `docker exec` into the running
-    # tmp-api rather than `compose run`, so no container is created every 10 minutes; the
+    # tmp-api rather than `compose run`, so no container is created on every run; the
     # CLI shares tmp-api's cgroup (API ~65 MB of 256 MB). Output goes to journald
     # (`journalctl -t tmp-rates`), which rotates it. A stopped tmp-api just skips a run.
     require_provisioned
@@ -782,7 +782,7 @@ SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CLI="node dist/src/cli/exchange-rates.cli.js"
 # Crypto prices (CoinGecko, one call for all coins).
-*/10 * * * * root docker exec tmp-api $CLI fetch:crypto 2>&1 | logger -t tmp-rates
+2 * * * * root docker exec tmp-api $CLI fetch:crypto 2>&1 | logger -t tmp-rates
 # Fiat for USD/EUR/GBP bases (plus crypto), once a day.
 15 2 * * * root docker exec tmp-api $CLI fetch 2>&1 | logger -t tmp-rates
 # Connected accounts: sync up to 10 due wallets, one at a time (a no-op while the
