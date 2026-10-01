@@ -18,9 +18,13 @@
 #   ./trackmypocket.sh mail-key    turn on real email: Resend SMTP, key from a hidden prompt
 #                                  ON THE SERVER; reports length + prefix only
 #   ./trackmypocket.sh google-key  Sign in with Google: client ids + the web client secret
+#   ./trackmypocket.sh conn-key    connected accounts: generate CONNECTIONS_ENC_KEYS ON THE
+#                                  SERVER (once; never replaces an existing key)
+#   ./trackmypocket.sh flag <key> [on|off]  show or set a remote feature flag
 #   ./trackmypocket.sh rates       fetch exchange rates once
-#   ./trackmypocket.sh cron        install the server's rate schedule (crypto every 10 min,
-#                                  fiat + crypto daily 02:15 UTC); `cron remove` uninstalls
+#   ./trackmypocket.sh cron        install the server's schedule (crypto rates every 10 min,
+#                                  fiat + crypto daily 02:15 UTC, connected-account sync
+#                                  every 15 min); `cron remove` uninstalls
 #
 # THIS DROPLET IS BIPPASS'S, and BipPass takes money. Read trackmypocket/docker-compose.yml
 # next to this script for the three rules that keep one from taking down the other: a
@@ -550,6 +554,50 @@ PROVISION
     echo "$WEB_ORIGIN. A failed send appears in '$SELF logs tmp-api' as '[EMAIL] ... not sent: <reason>'."
     ;;
 
+  conn-key)
+    require_provisioned
+    # Connected accounts encrypt wallet addresses (and later OAuth tokens) with
+    # CONNECTIONS_ENC_KEYS="1:<base64 32 bytes>". The key is generated ON THE SERVER and
+    # written straight to .env: it never reaches this machine, an argument or a chat.
+    # An existing key is NEVER replaced: version 1 also keys the duplicate check, so
+    # replacing it would make every stored connection unreadable. Rotation (adding a
+    # version 2) is the API's `connections.cli.js rotate-keys`, done by hand.
+    ssh "$HOST" "cd $REMOTE || exit 1
+      if grep -q '^CONNECTIONS_ENC_KEYS=.' .env; then
+        line=\$(grep '^CONNECTIONS_ENC_KEYS=' .env | head -1); val=\${line#*=}
+        echo \"CONNECTIONS_ENC_KEYS is already set (\${#val} chars) — kept, nothing changed\"
+        unset val line
+        exit 0
+      fi
+      key=\$(openssl rand -base64 32) || exit 1
+      tmp=\$(mktemp) || exit 1
+      grep -v '^CONNECTIONS_ENC_KEYS=' .env > \"\$tmp\"
+      printf 'CONNECTIONS_ENC_KEYS=1:%s\n' \"\$key\" >> \"\$tmp\"
+      cat \"\$tmp\" > .env; rc=\$?; rm -f \"\$tmp\"; unset key
+      [ \$rc -eq 0 ] || { echo '! could not write .env' >&2; exit 1; }
+      line=\$(grep '^CONNECTIONS_ENC_KEYS=' .env | head -1); val=\${line#*=}
+      echo \"stored CONNECTIONS_ENC_KEYS (\${#val} chars, version 1)\"
+      unset val line
+      # up -d, not restart: compose recreates the container because its env changed.
+      echo 'recreating tmp-api…'
+      docker compose up -d tmp-api >/dev/null 2>&1 && echo '  done' || { echo '! docker compose up failed' >&2; exit 1; }"
+    ;;
+
+  flag)
+    require_provisioned
+    # Remote feature flags (feature_flags table), read per request: no restart needed.
+    key=${2:-}; want=${3:-}
+    case "$key" in ''|*[!A-Za-z0-9_]*) echo "usage: $SELF flag <key> [on|off]" >&2; exit 1 ;; esac
+    case "$want" in
+      '')  sql="SELECT key, enabled FROM feature_flags WHERE key = '$key';" ;;
+      on)  sql="UPDATE feature_flags SET enabled = true,  updated_at = NOW() WHERE key = '$key' RETURNING key, enabled;" ;;
+      off) sql="UPDATE feature_flags SET enabled = false, updated_at = NOW() WHERE key = '$key' RETURNING key, enabled;" ;;
+      *)   echo "usage: $SELF flag <key> [on|off]" >&2; exit 1 ;;
+    esac
+    ssh "$HOST" "PGSU=\$(sed -n 's/^DB_USERNAME=//p' $BIPPASS_REMOTE/.env 2>/dev/null | head -1)
+      docker exec -i $PG psql -v ON_ERROR_STOP=1 -U \"\${PGSU:-bippass}\" -d trackmypocket -tA" <<<"$sql"
+    ;;
+
   google-key)
     require_provisioned
     # Sign in with Google. Writes the web client id, its redirect URI and the mobile client
@@ -703,6 +751,9 @@ CLI="node dist/src/cli/exchange-rates.cli.js"
 */10 * * * * root docker exec tmp-api $CLI fetch:crypto 2>&1 | logger -t tmp-rates
 # Fiat for USD/EUR/GBP bases (plus crypto), once a day.
 15 2 * * * root docker exec tmp-api $CLI fetch 2>&1 | logger -t tmp-rates
+# Connected accounts: sync up to 10 due wallets, one at a time (a no-op while the
+# connectedAccounts flag is off). Logs: journalctl -t tmp-connections
+*/15 * * * * root docker exec tmp-api node dist/src/cli/connections.cli.js sync-due 2>&1 | logger -t tmp-connections
 CRON
     ;;
 
