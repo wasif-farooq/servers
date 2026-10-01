@@ -26,7 +26,7 @@
 #   ./trackmypocket.sh rates       fetch exchange rates once
 #   ./trackmypocket.sh cron        install the server's schedule (crypto rates every 10 min,
 #                                  fiat + crypto daily 02:15 UTC, connected-account sync
-#                                  every 15 min); `cron remove` uninstalls
+#                                  hourly at :07); `cron remove` uninstalls
 #
 # THIS DROPLET IS BIPPASS'S, and BipPass takes money. Read trackmypocket/docker-compose.yml
 # next to this script for the three rules that keep one from taking down the other: a
@@ -786,8 +786,10 @@ CLI="node dist/src/cli/exchange-rates.cli.js"
 # Fiat for USD/EUR/GBP bases (plus crypto), once a day.
 15 2 * * * root docker exec tmp-api $CLI fetch 2>&1 | logger -t tmp-rates
 # Connected accounts: sync up to 10 due wallets, one at a time (a no-op while the
-# connectedAccounts flag is off). Logs: journalctl -t tmp-connections
-*/15 * * * * root docker exec tmp-api node dist/src/cli/connections.cli.js sync-due 2>&1 | logger -t tmp-connections
+# connectedAccounts flag is off). Hourly to spare the free provider quotas (Etherscan
+# 3 calls/s, 100k/day); a busy wallet's first history import continues one run per
+# hour. Logs: journalctl -t tmp-connections
+7 * * * * root docker exec tmp-api node dist/src/cli/connections.cli.js sync-due 2>&1 | logger -t tmp-connections
 CRON
     ;;
 
