@@ -863,8 +863,60 @@ CRON
     check_rev frontend "$FE_REPO" tmp-web
     ;;
 
+  revenuecat-key)
+    require_provisioned
+    # Google Play billing through RevenueCat (P15). Everything happens ON THE SERVER:
+    #   REVENUECAT_WEBHOOK_AUTH    generated there once (64 hex chars) and kept. It is the
+    #                              Authorization header value RevenueCat must send: print it
+    #                              with `revenuecat-key show` IN YOUR OWN TERMINAL and paste it
+    #                              into RevenueCat › Integrations › Webhooks.
+    #   REVENUECAT_SECRET_API_KEY  hidden prompt (RevenueCat › API keys › secret key); Enter
+    #                              keeps the current one. Only its length is reported.
+    #   REVENUECAT_ACCEPT_SANDBOX  true: staging takes Play test purchases.
+    # Read at startup, so tmp-api is recreated; no rebuild.
+    RC_MODE=${2:-set}
+    case "$RC_MODE" in set|show) ;; *) echo "usage: $SELF revenuecat-key [show]" >&2; exit 1 ;; esac
+    RC_REMOTE='cd "$REMOTE" || exit 1
+      setkv() {
+        tmp=$(mktemp) || return 1
+        grep -v "^$1=" .env > "$tmp"
+        printf "%s=%s\n" "$1" "$2" >> "$tmp"
+        cat "$tmp" > .env; rc=$?; rm -f "$tmp"; return $rc
+      }
+      if [ "$RC_MODE" = show ]; then
+        v=$(sed -n "s/^REVENUECAT_WEBHOOK_AUTH=//p" .env | head -1)
+        [ -n "$v" ] || { echo "no REVENUECAT_WEBHOOK_AUTH yet: run revenuecat-key first" >&2; exit 1; }
+        printf "%s\n" "$v"; exit 0
+      fi
+      if grep -q "^REVENUECAT_WEBHOOK_AUTH=." .env; then
+        echo "  REVENUECAT_WEBHOOK_AUTH kept"
+      else
+        secret=$(openssl rand -hex 32 2>/dev/null || tr -dc a-f0-9 </dev/urandom | head -c 64)
+        [ ${#secret} -eq 64 ] || { echo "! could not generate a secret" >&2; exit 1; }
+        setkv REVENUECAT_WEBHOOK_AUTH "$secret" || { echo "! could not write .env" >&2; exit 1; }
+        unset secret
+        echo "  REVENUECAT_WEBHOOK_AUTH generated (print it with: revenuecat-key show)"
+      fi
+      read -rsp "REVENUECAT_SECRET_API_KEY (Enter keeps the current one): " KEY; echo
+      if [ -n "$KEY" ]; then
+        case "$KEY" in *[[:space:]]*) echo "! the key contains whitespace — not stored" >&2; exit 1 ;; esac
+        setkv REVENUECAT_SECRET_API_KEY "$KEY" || { echo "! could not write .env" >&2; exit 1; }
+        printf "  REVENUECAT_SECRET_API_KEY stored (%d chars)\n" "${#KEY}"; unset KEY
+      else
+        grep -q "^REVENUECAT_SECRET_API_KEY=." .env && echo "  REVENUECAT_SECRET_API_KEY kept" || echo "  REVENUECAT_SECRET_API_KEY not set yet"
+      fi
+      setkv REVENUECAT_ACCEPT_SANDBOX true && echo "  REVENUECAT_ACCEPT_SANDBOX=true"
+      echo "recreating tmp-api…"
+      docker compose up -d tmp-api >/dev/null 2>&1 && echo "  done" || { echo "! docker compose up failed" >&2; exit 1; }'
+    if [ "$RC_MODE" = show ]; then
+      ssh "$HOST" "REMOTE=$REMOTE RC_MODE=show bash -c $(printf '%q' "$RC_REMOTE")"
+    else
+      ssh -t "$HOST" "REMOTE=$REMOTE RC_MODE=set bash -c $(printf '%q' "$RC_REMOTE")"
+    fi
+    ;;
+
   *)
-    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|ai-key|mail-key|google-key|rates|cron [remove]]" >&2
+    echo "usage: $SELF [shell|provision|build|deploy|expose|status|logs [service]|paddle-key|ai-key|mail-key|google-key|revenuecat-key [show]|rates|cron [remove]]" >&2
     exit 2
     ;;
 esac
