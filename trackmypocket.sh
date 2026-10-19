@@ -781,8 +781,8 @@ PROVISION
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CLI="node dist/src/cli/exchange-rates.cli.js"
-# Crypto prices (CoinGecko, one call for all coins).
-2 * * * * root docker exec tmp-api $CLI fetch:crypto 2>&1 | logger -t tmp-rates
+# No hourly crypto price job: the crypto flag is off on staging (2026-10-19). To bring it
+# back, add: 2 * * * * root docker exec tmp-api $CLI fetch:crypto 2>&1 | logger -t tmp-rates
 # Fiat for USD/EUR/GBP bases (plus crypto), once a day.
 15 2 * * * root docker exec tmp-api $CLI fetch 2>&1 | logger -t tmp-rates
 # Connected accounts: sync up to 10 due wallets, one at a time (a no-op while the
