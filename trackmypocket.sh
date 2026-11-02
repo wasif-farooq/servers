@@ -277,7 +277,7 @@ FRONTEND_URL=${WEB_ORIGIN}
 # Email. MAIL_PROVIDER=console sends nothing: every email (verification, password reset,
 # 2FA, invitations, account deletion), codes included, is printed to the API log.
 # Set by: trackmypocket.sh mail-key, which switches to Resend over SMTP
-# (MAIL_PROVIDER=smtp, smtp.resend.com:465, MAIL_USERNAME=resend, MAIL_PASSWORD=the
+# (MAIL_PROVIDER=smtp, smtp.resend.com:2465 — DigitalOcean blocks 25/465/587, MAIL_USERNAME=resend, MAIL_PASSWORD=the
 # Resend API key). With smtp, codes go only to the inbox and never to the log.
 # The API logs "[EMAIL] Mail provider: ..." at startup; the password is never printed.
 MAIL_PROVIDER=console
@@ -486,7 +486,7 @@ PROVISION
     # this machine's env or shell history, never a chat window. Only its length and
     # whether it starts with re_ are reported.
     #
-    # Upserts the whole Resend block (implicit TLS on 465; the username is literally
+    # Upserts the whole Resend block (implicit TLS on 2465, since DigitalOcean blocks 465; the username is literally
     # "resend") so a half-configured .env cannot linger, then recreates tmp-api (env is
     # read at runtime, no rebuild) and shows the API's own "[EMAIL] Mail provider" line.
     #
@@ -522,7 +522,7 @@ PROVISION
 
       upsert MAIL_PROVIDER smtp &&
       upsert MAIL_HOST smtp.resend.com &&
-      upsert MAIL_PORT 465 &&
+      upsert MAIL_PORT 2465 &&
       upsert MAIL_SMTP_SECURE true &&
       upsert MAIL_USERNAME resend &&
       upsert MAIL_FROM_ADDRESS noreply@trackmypocket.com &&
